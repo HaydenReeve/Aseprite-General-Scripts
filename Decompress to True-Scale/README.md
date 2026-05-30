@@ -37,13 +37,13 @@ Alternatively, symlink the script for development:
 ```powershell
 New-Item -ItemType SymbolicLink `
     -Path "$env:APPDATA\Aseprite\scripts\Decompress to True-Scale.lua" `
-    -Target "D:\Aseprite\Decompress to True-Scale\Decompress to True-Scale.lua"
+    -Target "<repo-root>\Decompress to True-Scale\Decompress to True-Scale.lua"
 ```
 
 ## CLI / Batch Testing
 
 ```powershell
-$aseprite = "C:\Program Files (x86)\Steam\steamapps\common\Aseprite\aseprite.exe"
+$aseprite = "<path-to-aseprite>\aseprite.exe"
 & $aseprite -b input.aseprite --script-param raise_errors=true `
     --script "Decompress to True-Scale.lua" --save-as output.png
 ```
