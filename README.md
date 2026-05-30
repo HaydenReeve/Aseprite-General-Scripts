@@ -48,6 +48,6 @@ After that, run `File > Scripts > Rescan Scripts`, or restart Aseprite.
 
 These scripts were originally published as individual GitHub Gists:
 
-- **Decompress to True-Scale:** `https://gist.github.com/fb2aaa86d2701e4e5cb20767b3c80cb7`
-- **Export For FoundryVTT:** `https://gist.github.com/bc42a9748dc73beaa14b708774acf5db`
-- **Import PDN to Aseprite:** `https://gist.github.com/HaydenReeve/d1f75e4bb4aa9d38c1fc86c592976ae2`
+- **Decompress to True-Scale:** https://gist.github.com/fb2aaa86d2701e4e5cb20767b3c80cb7
+- **Export For FoundryVTT:** https://gist.github.com/bc42a9748dc73beaa14b708774acf5db
+- **Import PDN to Aseprite:** https://gist.github.com/HaydenReeve/d1f75e4bb4aa9d38c1fc86c592976ae2
