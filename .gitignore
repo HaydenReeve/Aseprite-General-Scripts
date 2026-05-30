@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*Output*.png
+elastic_output.png
+trace.txt
+test_log.txt
+test_output.png
