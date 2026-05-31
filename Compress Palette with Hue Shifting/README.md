@@ -35,6 +35,8 @@ aseprite -b ".\sprite.aseprite" `
 - **Stops per ramp** — colours per ramp when `Size by = Ramps x Stops`. `0` = auto, derived from source lightness span.
 - **Strength** — blends source-derived ramp parameters with the stylised reference (warm highlights / cool shadows). `0` = preserve source, `1` = full stylisation.
 - **Share shadow anchor** / **Share highlight anchor** — replace every chromatic ramp's darkest / brightest stop with one weighted-OKLab averaged colour, emitted once in the palette. Improves ramp cohesion and reduces palette size. Both on by default.
+- **Preserve accents** — detect rare, high-chroma source colours (vivid rim lights, glow specks, attention-grabbing details) and reserve them as standalone palette entries instead of folding them into a ramp. On by default.
+- **Accent slots** — hard cap on how many accents the script may reserve. The script also self-limits to `floor((n_chromatic - 1) / 3)` so ramps still get most of the palette.
 - **Output** — `New layer` (non-destructive) or `In place` (rewrite all editable cels).
 
 ## CLI params
@@ -52,6 +54,11 @@ Visible UI params, plus:
 | `grey_budget`         | 3       | Grey ramp stops when achromatic colours are present and `size_mode = Total colours`. |
 | `shared_shadow`       | true    | Merge all chromatic ramps' darkest stop to one anchor. |
 | `shared_highlight`    | true    | Merge all chromatic ramps' brightest stop to one anchor. |
+| `accent_detection`    | true    | Enable rare + high-chroma accent preservation. |
+| `max_accent_slots`    | 4       | Maximum palette entries reserved for accents. |
+| `accent_chroma_mad`   | 2.5     | MAD multiplier for the chroma outlier test. Higher = fewer accents detected. |
+| `accent_score_threshold` | 0.55 | Combined chroma + rarity score threshold for accent eligibility. |
+| `accent_tolerance`    | 0.07    | OKLab ΔE; accents closer than this to an existing palette entry reuse it instead of emitting a duplicate. |
 | `raise_errors`        | false   | Convert UI alerts to thrown errors (for CLI / batch). |
 
 ## Pipeline

@@ -30,6 +30,12 @@ local DEFAULT_CONFIG <const> = {
     kmeans_seed = 42,
     elbow_kmax = 8,
     grey_stops_max = 5,
+    -- Accent preservation
+    accent_detection = true,
+    max_accent_slots = 4,
+    accent_chroma_mad = 2.5,
+    accent_score_threshold = 0.55,
+    accent_tolerance = 0.07,        -- OKLab ΔE threshold for "already represented"
 }
 
 local pc <const> = app.pixelColor
@@ -528,9 +534,84 @@ local function oklab_d2(L1, a1, b1, L2, a2, b2)
     return dL * dL + da * da + db * db
 end
 
+-- ============================================================
+-- Accent detection (rare + high-chroma colours preserved as standalone palette entries)
+-- ============================================================
+
+-- Compute combined salience (chroma MAD + rarity) for chromatic entries.
+-- Returns: scores[i] in [0,1] per chromatic index, or nil if input too small/degenerate.
+local function compute_accent_scores(chromatic, k_mad)
+    local n = #chromatic
+    if n < 4 then return nil end                    -- need a reasonable distribution
+
+    -- Median + MAD of chroma
+    local cs = {}
+    for i = 1, n do cs[i] = chromatic[i].C end
+    table.sort(cs)
+    local mid = math.floor(n / 2)
+    local median_c = (n % 2 == 1) and cs[mid + 1] or (cs[mid] + cs[mid + 1]) * 0.5
+    local devs = {}
+    for i = 1, n do devs[i] = math.abs(cs[i] - median_c) end
+    table.sort(devs)
+    local mid2 = math.floor(n / 2)
+    local mad = (n % 2 == 1) and devs[mid2 + 1] or (devs[mid2] + devs[mid2 + 1]) * 0.5
+    local sigma_hat = 1.4826 * mad
+    if sigma_hat < 1e-4 then sigma_hat = 1e-4 end   -- guard flat distributions
+
+    -- Rarity normaliser
+    local max_w = 1
+    for i = 1, n do if chromatic[i].w > max_w then max_w = chromatic[i].w end end
+    local log_denom = math.log(max_w + 1)
+    if log_denom < 1e-6 then log_denom = 1e-6 end
+
+    local scores = {}
+    for i = 1, n do
+        local e = chromatic[i]
+        local z = (e.C - median_c) / sigma_hat
+        local S_c = math.max(0, math.min(1, z / 3.0))
+        local S_r = 1.0 - math.log(e.w + 1) / log_denom
+        if S_r < 0 then S_r = 0 end
+        scores[i] = 0.6 * S_c + 0.4 * S_r
+    end
+    return scores
+end
+
+-- Pick the highest-salience entries above threshold, capped by max_slots.
+-- Returns an array of accent entries (objects from `chromatic`) and a set of their keys.
+local function select_accents(chromatic, scores, threshold, max_slots)
+    if not scores or max_slots <= 0 then return {}, {} end
+    local order = {}
+    for i = 1, #chromatic do
+        if scores[i] >= threshold then
+            order[#order + 1] = { idx = i, score = scores[i] }
+        end
+    end
+    table.sort(order, function(a, b) return a.score > b.score end)
+    local accents, key_set = {}, {}
+    for i = 1, math.min(max_slots, #order) do
+        local e = chromatic[order[i].idx]
+        accents[#accents + 1] = e
+        key_set[e.key] = true
+    end
+    return accents, key_set
+end
+
+-- Build a filtered chromatic list excluding accents, plus a forward index map
+-- (filtered_index -> original_chromatic_index) so cluster assignments can be unmapped later.
+local function partition_accents(chromatic, accent_key_set)
+    local filtered, to_orig = {}, {}
+    for i, e in ipairs(chromatic) do
+        if not accent_key_set[e.key] then
+            filtered[#filtered + 1] = e
+            to_orig[#filtered] = i
+        end
+    end
+    return filtered, to_orig
+end
+
 -- Build palette index for output. Shared anchors emitted once; (ramp, endpoint) pairs map to the shared index.
--- Returns: entries (palette), ordered_ramps, stop_to_pal map.
-local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
+-- Returns: entries (palette), ordered_ramps, stop_to_pal map, accent_key_to_pi.
+local function flatten_palette(ramps, alpha_present, shared_dark, shared_light, accents, accent_tolerance)
     local chroma, grey = {}, {}
     for _, r in ipairs(ramps) do
         if r.kind == "grey" then grey[#grey + 1] = r
@@ -549,14 +630,13 @@ local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
         entries[#entries + 1] = {
             r = r8, g = g8, b = b8, a = 255, L = L, A = A, B = B, ramp = ri, stop = si,
         }
-        return #entries - 1  -- 0-based palette index
+        return #entries - 1
     end
 
     if alpha_present then
         entries[#entries + 1] = { r = 0, g = 0, b = 0, a = 0, L = 0, A = 0, B = 0, ramp = 0, stop = 0 }
     end
 
-    -- Ordered ramp indices for chromatic ramps (1..#chroma)
     local n_chrom = #chroma
     local use_shared_dark = shared_dark and n_chrom >= 2
     local use_shared_light = shared_light and n_chrom >= 2
@@ -588,6 +668,43 @@ local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
         end
     end
 
+    -- Accents: emit each accent as a standalone entry unless an existing palette
+    -- entry already matches it by exact RGB or sits within accent_tolerance ΔE in OKLab.
+    local accent_key_to_pi = {}
+    if accents and #accents > 0 then
+        local rgb_to_pi = {}
+        for pi_zero = 0, #entries - 1 do
+            local pe = entries[pi_zero + 1]
+            if pe.a ~= 0 then
+                local rk = pe.r * 65536 + pe.g * 256 + pe.b
+                if rgb_to_pi[rk] == nil then rgb_to_pi[rk] = pi_zero end
+            end
+        end
+        local tol2 = (accent_tolerance or 0.07) ^ 2
+        for _, ae in ipairs(accents) do
+            local rk = ae.r * 65536 + ae.g * 256 + ae.b
+            local match_pi = rgb_to_pi[rk]
+            if match_pi == nil then
+                local best_d2 = math.huge
+                for pi_zero = 0, #entries - 1 do
+                    local pe = entries[pi_zero + 1]
+                    if pe.a ~= 0 then
+                        local d2 = oklab_d2(ae.L, ae.A, ae.B, pe.L, pe.A, pe.B)
+                        if d2 < best_d2 then
+                            best_d2 = d2
+                            if d2 <= tol2 then match_pi = pi_zero end
+                        end
+                    end
+                end
+            end
+            if match_pi ~= nil then
+                accent_key_to_pi[ae.key] = match_pi
+            else
+                accent_key_to_pi[ae.key] = emit(ae.r, ae.g, ae.b, -2, -2)
+            end
+        end
+    end
+
     -- Grey ramps (each entry distinct, no sharing across grey ramps in v0.2)
     local grey_offset = n_chrom
     for gi, r in ipairs(grey) do
@@ -597,24 +714,28 @@ local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
         end
     end
 
-    return entries, ordered, stop_to_pal
+    return entries, ordered, stop_to_pal, accent_key_to_pi
 end
 
-local function build_remap(entries, assignments, palette_entries, ordered_ramps, stop_to_pal)
+local function build_remap(entries, assignments, palette_entries, ordered_ramps, stop_to_pal, skip_keys)
     local remap = {}
     for i, e in ipairs(entries) do
-        local ri = assignments[i]
-        local ramp = ordered_ramps[ri]
-        local best_pi, best_d2 = 0, math.huge
-        for si, s in ipairs(ramp.stops) do
-            local L, A, B = rgb_to_oklab(s.r, s.g, s.b)
-            local d2 = oklab_d2(e.L, e.A, e.B, L, A, B)
-            if d2 < best_d2 then
-                best_d2 = d2
-                best_pi = stop_to_pal[ri * 64 + si] or 0
+        if not (skip_keys and skip_keys[e.key]) then
+            local ri = assignments[i]
+            local ramp = ri and ordered_ramps[ri] or nil
+            if ramp then
+                local best_pi, best_d2 = 0, math.huge
+                for si, s in ipairs(ramp.stops) do
+                    local L, A, B = rgb_to_oklab(s.r, s.g, s.b)
+                    local d2 = oklab_d2(e.L, e.A, e.B, L, A, B)
+                    if d2 < best_d2 then
+                        best_d2 = d2
+                        best_pi = stop_to_pal[ri * 64 + si] or 0
+                    end
+                end
+                remap[e.key] = best_pi
             end
         end
-        remap[e.key] = best_pi
     end
     return remap
 end
@@ -709,6 +830,11 @@ local function parse_cli_params(cfg)
     cfg.grey_budget = num("grey_budget") or cfg.grey_budget
     local ss = bool("shared_shadow"); if ss ~= nil then cfg.shared_shadow = ss end
     local sh = bool("shared_highlight"); if sh ~= nil then cfg.shared_highlight = sh end
+    local ad = bool("accent_detection"); if ad ~= nil then cfg.accent_detection = ad end
+    cfg.max_accent_slots = num("max_accent_slots") or cfg.max_accent_slots
+    cfg.accent_chroma_mad = num("accent_chroma_mad") or cfg.accent_chroma_mad
+    cfg.accent_score_threshold = num("accent_score_threshold") or cfg.accent_score_threshold
+    cfg.accent_tolerance = num("accent_tolerance") or cfg.accent_tolerance
     return cfg
 end
 
@@ -756,23 +882,68 @@ local function run(cfg)
         end
     end
 
+    -- 3b. Accent detection: identify rare + high-chroma colours to preserve verbatim.
+    local accents, accent_key_set = {}, {}
+    if cfg.accent_detection and cfg.max_accent_slots and cfg.max_accent_slots > 0 then
+        local scores = compute_accent_scores(chromatic, cfg.accent_chroma_mad)
+        if scores then
+            -- Reserve at most floor((n-1)/3) slots so we always leave room for ramps.
+            local hard_cap = math.max(0, math.floor((#chromatic - 1) / 3))
+            local cap = math.min(cfg.max_accent_slots, hard_cap)
+            accents, accent_key_set = select_accents(chromatic, scores, cfg.accent_score_threshold, cap)
+        end
+    end
+
+    -- 3b'. Budget pre-trim: in "Total colours" mode, drop accents from the tail until
+    -- the remaining budget can accommodate at least the minimum ramps + grey + alpha.
+    -- Done before partitioning so dropped accents fall back into the cluster pool.
+    if cfg.size_mode == "Total colours" and #accents > 0 then
+        local has_grey = #achromatic > 0
+        local grey_stops = has_grey and math.max(2, math.min(cfg.grey_stops_max, cfg.grey_budget)) or 0
+        local alpha_slot = alpha_present and 1 or 0
+        -- Pessimistic n_chrom estimate: if user pinned ramps, use it; otherwise take an upper bound.
+        local n_chrom_est
+        if cfg.ramps and cfg.ramps > 0 then
+            n_chrom_est = math.floor(cfg.ramps)
+        else
+            n_chrom_est = math.min(cfg.elbow_kmax, math.max(0, #chromatic - #accents))
+        end
+        local min_ramp_slots = 2 * n_chrom_est       -- at least 2 stops per ramp
+        while #accents > 0
+            and (cfg.target_colours - #accents) < (min_ramp_slots + grey_stops + alpha_slot) do
+            local dropped = accents[#accents]
+            accent_key_set[dropped.key] = nil
+            accents[#accents] = nil
+        end
+    end
+
+    -- 3c. Filter accents out of chromatic pool used for clustering.
+    local chrom_for_cluster, cluster_to_chrom_idx
+    if #accents > 0 then
+        chrom_for_cluster, cluster_to_chrom_idx = partition_accents(chromatic, accent_key_set)
+    else
+        chrom_for_cluster = chromatic
+        cluster_to_chrom_idx = {}
+        for i = 1, #chromatic do cluster_to_chrom_idx[i] = i end
+    end
+
     -- 4. Decide ramp count (from cfg or elbow)
     local target_ramps
     if cfg.ramps and cfg.ramps > 0 then
         target_ramps = math.floor(cfg.ramps)
     else
-        if #chromatic >= 2 then
-            target_ramps = elbow_k(chromatic, math.min(cfg.elbow_kmax, #chromatic))
+        if #chrom_for_cluster >= 2 then
+            target_ramps = elbow_k(chrom_for_cluster, math.min(cfg.elbow_kmax, #chrom_for_cluster))
         else
-            target_ramps = #chromatic
+            target_ramps = #chrom_for_cluster
         end
     end
-    target_ramps = clamp(target_ramps, 0, math.max(0, #chromatic))
+    target_ramps = clamp(target_ramps, 0, math.max(0, #chrom_for_cluster))
 
     -- 5. Cluster chromatic colours by hue
     local clusters, centroids = {}, {}
     if target_ramps > 0 then
-        clusters, centroids = kmeans_hue(chromatic, target_ramps, cfg.kmeans_max_iter, cfg.kmeans_seed)
+        clusters, centroids = kmeans_hue(chrom_for_cluster, target_ramps, cfg.kmeans_max_iter, cfg.kmeans_seed)
         local kept_c, kept_h = {}, {}
         for j = 1, #clusters do
             if #clusters[j] >= 1 then
@@ -797,15 +968,17 @@ local function run(cfg)
         for ci, cluster in ipairs(clusters) do
             local lo, hi = math.huge, -math.huge
             for _, idx in ipairs(cluster) do
-                local L = chromatic[idx].L
+                local L = chrom_for_cluster[idx].L
                 if L < lo then lo = L end
                 if L > hi then hi = L end
             end
             lspans[ci] = hi - lo
         end
+        -- Reserve accent slots out of the budget so the final palette honours the target.
+        local effective_target = cfg.target_colours - #accents
         local base
         base, per_ramp_extra = solve_stops_for_target(
-            cfg.target_colours, n_chrom, grey_stops, alpha_present,
+            effective_target, n_chrom, grey_stops, alpha_present,
             cfg.shared_shadow, cfg.shared_highlight, lspans)
         stops_override = base
         cfg._grey_stops_forced = grey_stops
@@ -821,7 +994,7 @@ local function run(cfg)
         if per_ramp_extra and per_ramp_extra[j] then
             stops_for_this = stops_override + per_ramp_extra[j]
         end
-        ramps[#ramps + 1] = build_chromatic_ramp(chromatic, cluster, cfg, stops_for_this)
+        ramps[#ramps + 1] = build_chromatic_ramp(chrom_for_cluster, cluster, cfg, stops_for_this)
         for _, ci in ipairs(cluster) do
             chromatic_assignments[ci] = #ramps
         end
@@ -845,14 +1018,14 @@ local function run(cfg)
         end
     end
 
-    if #ramps == 0 then
+    if #ramps == 0 and #accents == 0 then
         fail("Could not build any ramps from sprite.")
         return
     end
 
-    -- 10. Flatten palette
-    local palette_entries, ordered_ramps, stop_to_pal =
-        flatten_palette(ramps, alpha_present, shared_dark, shared_light)
+    -- 10. Flatten palette (also emits accents between shared_light and grey)
+    local palette_entries, ordered_ramps, stop_to_pal, accent_key_to_pi =
+        flatten_palette(ramps, alpha_present, shared_dark, shared_light, accents, cfg.accent_tolerance)
 
     -- 11. Re-map original assignments to (possibly reordered) ordered_ramps
     local ramp_to_ordered = {}
@@ -864,6 +1037,7 @@ local function run(cfg)
 
     -- 12. Build per-source assignments over `entries` array
     local source_assignments = {}
+    -- Map original chromatic index -> entry index
     local chrom_to_entry = {}
     do
         local ci = 0
@@ -883,12 +1057,20 @@ local function run(cfg)
             source_assignments[ei] = grey_ordered_index
         end
     end
-    for ci, ramp_idx in pairs(chromatic_assignments) do
-        local ei = chrom_to_entry[ci]
-        source_assignments[ei] = ramp_to_ordered[ramp_idx]
+    -- chromatic_assignments is keyed by index into chrom_for_cluster; map via cluster_to_chrom_idx.
+    for filtered_ci, ramp_idx in pairs(chromatic_assignments) do
+        local orig_ci = cluster_to_chrom_idx[filtered_ci]
+        if orig_ci then
+            local ei = chrom_to_entry[orig_ci]
+            if ei then source_assignments[ei] = ramp_to_ordered[ramp_idx] end
+        end
     end
 
-    local remap = build_remap(entries, source_assignments, palette_entries, ordered_ramps, stop_to_pal)
+    local remap = build_remap(entries, source_assignments, palette_entries, ordered_ramps, stop_to_pal, accent_key_set)
+    -- Direct accent mappings (skip the ramp distance search).
+    if accent_key_to_pi then
+        for k, pi in pairs(accent_key_to_pi) do remap[k] = pi end
+    end
 
     -- 9. Apply: write new palette + remap pixels
     app.transaction(COMMAND_TITLE, function()
@@ -992,6 +1174,17 @@ local function show_dialog()
     dlg:slider { id = "strength", label = "Strength", min = 0, max = 100, value = round(cfg.strength * 100) }
     dlg:check { id = "shared_shadow", label = "Share shadow anchor", selected = cfg.shared_shadow }
     dlg:check { id = "shared_highlight", label = "Share highlight anchor", selected = cfg.shared_highlight }
+    dlg:separator { text = "Accent preservation" }
+    dlg:check { id = "accent_detection", label = "Preserve accents",
+        selected = cfg.accent_detection,
+        onclick = function()
+            local on = dlg.data.accent_detection
+            dlg:modify { id = "max_accent_slots", visible = on }
+        end,
+    }
+    dlg:number { id = "max_accent_slots", label = "Accent slots",
+        text = tostring(cfg.max_accent_slots), decimals = 0,
+        visible = cfg.accent_detection }
     dlg:combobox { id = "output", label = "Output", option = cfg.output,
         options = { "New layer", "In place" } }
     dlg:separator()
@@ -1010,6 +1203,8 @@ local function show_dialog()
     cfg.strength = (data.strength or 50) / 100.0
     cfg.shared_shadow = data.shared_shadow
     cfg.shared_highlight = data.shared_highlight
+    cfg.accent_detection = data.accent_detection
+    cfg.max_accent_slots = data.max_accent_slots or cfg.max_accent_slots
     cfg.output = data.output
     run(cfg)
 end
