@@ -10,6 +10,8 @@ local OUTPUT_LAYER_NAME <const> = "Compressed (Hue-Shifted)"
 
 local DEFAULT_CONFIG <const> = {
     mode = "Hybrid",                -- Hybrid | Stylise
+    size_mode = "Ramps x Stops",    -- Ramps x Stops | Total colours
+    target_colours = 32,             -- used when size_mode = "Total colours"
     ramps = 0,                       -- 0 = auto
     stops = 0,                       -- 0 = auto
     strength = 0.5,                  -- 0..1
@@ -21,7 +23,9 @@ local DEFAULT_CONFIG <const> = {
     cool_attractor_hue = 250.0,     -- blue-violet
     chroma_ceiling = 0.30,
     achromatic_threshold = 0.02,
-    shared_shadow = false,
+    shared_shadow = true,
+    shared_highlight = true,
+    grey_budget = 3,                 -- default grey ramp stops if achromatic present
     kmeans_max_iter = 40,
     kmeans_seed = 42,
     elbow_kmax = 8,
@@ -434,7 +438,9 @@ local function build_chromatic_ramp(entries, cluster_indices, cfg, stops_overrid
         local r, g, b, Lf, Cf, hf = gamut_clip_oklch(L, C, h)
         stops[k] = { r = r, g = g, b = b, L = Lf, C = Cf, h = hf, t = t }
     end
-    return { stops = stops, base_h = base_h, kind = "chromatic" }
+        local total_w = 0
+        for _, i in ipairs(cluster_indices) do total_w = total_w + entries[i].w end
+        return { stops = stops, base_h = base_h, kind = "chromatic", weight = total_w }
 end
 
 local function build_grey_ramp(entries, indices, cfg, stops_override)
@@ -457,7 +463,59 @@ local function build_grey_ramp(entries, indices, cfg, stops_override)
         local r, g, b = oklab_to_rgb(L, 0, 0)
         stops[k] = { r = r, g = g, b = b, L = L, C = 0, h = 0, t = t }
     end
-    return { stops = stops, base_h = 0, kind = "grey" }
+    return { stops = stops, base_h = 0, kind = "grey", weight = 0 }
+end
+
+-- ============================================================
+-- Shared anchors: weighted-OKLab average of all chromatic ramps' endpoint stops.
+-- Replaces each ramp's stop[1] (shadow) and/or stop[n] (highlight) with the merged colour.
+-- Returns the merged RGB for each end (or nil if not applied).
+-- ============================================================
+
+local function compute_anchor_oklab(ramps, stop_picker)
+    local sL, sa, sb, sw = 0, 0, 0, 0
+    for _, r in ipairs(ramps) do
+        local s = stop_picker(r)
+        local L, A, B = rgb_to_oklab(s.r, s.g, s.b)
+        local w = r.weight > 0 and r.weight or 1
+        sL = sL + L * w; sa = sa + A * w; sb = sb + B * w
+        sw = sw + w
+    end
+    if sw == 0 then return nil end
+    return sL / sw, sa / sw, sb / sw
+end
+
+local function apply_shared_anchors(chrom_ramps, cfg)
+    local shared_dark, shared_light = nil, nil
+    if #chrom_ramps < 2 then return shared_dark, shared_light end
+
+    if cfg.shared_shadow then
+        local L, a, b = compute_anchor_oklab(chrom_ramps, function(r) return r.stops[1] end)
+        if L then
+            local _, C, h = oklab_to_oklch(L, a, b)
+            local r8, g8, b8, Lf, Cf, hf = gamut_clip_oklch(L, C, h)
+            shared_dark = { r = r8, g = g8, b = b8, L = Lf, C = Cf, h = hf }
+            for _, ramp in ipairs(chrom_ramps) do
+                local s = ramp.stops[1]
+                s.r, s.g, s.b, s.L, s.C, s.h = r8, g8, b8, Lf, Cf, hf
+            end
+        end
+    end
+
+    if cfg.shared_highlight then
+        local L, a, b = compute_anchor_oklab(chrom_ramps, function(r) return r.stops[#r.stops] end)
+        if L then
+            local _, C, h = oklab_to_oklch(L, a, b)
+            local r8, g8, b8, Lf, Cf, hf = gamut_clip_oklch(L, C, h)
+            shared_light = { r = r8, g = g8, b = b8, L = Lf, C = Cf, h = hf }
+            for _, ramp in ipairs(chrom_ramps) do
+                local s = ramp.stops[#ramp.stops]
+                s.r, s.g, s.b, s.L, s.C, s.h = r8, g8, b8, Lf, Cf, hf
+            end
+        end
+    end
+
+    return shared_dark, shared_light
 end
 
 -- ============================================================
@@ -470,9 +528,9 @@ local function oklab_d2(L1, a1, b1, L2, a2, b2)
     return dL * dL + da * da + db * db
 end
 
--- Build palette index for output (palette ordering: ramp by hue asc, stops dark->light, grey last; transparent first if needed).
-local function flatten_palette(ramps, alpha_present)
-    -- Order ramps: chromatic by base_h asc, then grey last
+-- Build palette index for output. Shared anchors emitted once; (ramp, endpoint) pairs map to the shared index.
+-- Returns: entries (palette), ordered_ramps, stop_to_pal map.
+local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
     local chroma, grey = {}, {}
     for _, r in ipairs(ramps) do
         if r.kind == "grey" then grey[#grey + 1] = r
@@ -484,36 +542,65 @@ local function flatten_palette(ramps, alpha_present)
     for _, r in ipairs(grey) do ordered[#ordered + 1] = r end
 
     local entries = {}
+    local stop_to_pal = {}
+
+    local function emit(r8, g8, b8, ri, si)
+        local L, A, B = rgb_to_oklab(r8, g8, b8)
+        entries[#entries + 1] = {
+            r = r8, g = g8, b = b8, a = 255, L = L, A = A, B = B, ramp = ri, stop = si,
+        }
+        return #entries - 1  -- 0-based palette index
+    end
+
     if alpha_present then
         entries[#entries + 1] = { r = 0, g = 0, b = 0, a = 0, L = 0, A = 0, B = 0, ramp = 0, stop = 0 }
     end
-    for ri, r in ipairs(ordered) do
-        for si, s in ipairs(r.stops) do
-            local L, A, B = rgb_to_oklab(s.r, s.g, s.b)
-            entries[#entries + 1] = {
-                r = s.r, g = s.g, b = s.b, a = 255,
-                L = L, A = A, B = B,
-                ramp = ri, stop = si,
-            }
+
+    -- Ordered ramp indices for chromatic ramps (1..#chroma)
+    local n_chrom = #chroma
+    local use_shared_dark = shared_dark and n_chrom >= 2
+    local use_shared_light = shared_light and n_chrom >= 2
+
+    local shared_dark_pi, shared_light_pi
+
+    if use_shared_dark then
+        shared_dark_pi = emit(shared_dark.r, shared_dark.g, shared_dark.b, -1, -1)
+        for ri = 1, n_chrom do
+            stop_to_pal[ri * 16 + 1] = shared_dark_pi
         end
     end
-    return entries, ordered
+
+    for ri = 1, n_chrom do
+        local ramp = chroma[ri]
+        local n = #ramp.stops
+        local first = use_shared_dark and 2 or 1
+        local last = use_shared_light and (n - 1) or n
+        for si = first, last do
+            local s = ramp.stops[si]
+            stop_to_pal[ri * 16 + si] = emit(s.r, s.g, s.b, ri, si)
+        end
+    end
+
+    if use_shared_light then
+        shared_light_pi = emit(shared_light.r, shared_light.g, shared_light.b, -1, -1)
+        for ri = 1, n_chrom do
+            stop_to_pal[ri * 16 + #chroma[ri].stops] = shared_light_pi
+        end
+    end
+
+    -- Grey ramps (each entry distinct, no sharing across grey ramps in v0.2)
+    local grey_offset = n_chrom
+    for gi, r in ipairs(grey) do
+        local ri = grey_offset + gi
+        for si, s in ipairs(r.stops) do
+            stop_to_pal[ri * 16 + si] = emit(s.r, s.g, s.b, ri, si)
+        end
+    end
+
+    return entries, ordered, stop_to_pal
 end
 
--- Build per-source-colour remap table: rgb_key -> palette index.
--- Constrained remap: assignments[i] gives source colour i's assigned ramp; remap to nearest stop within that ramp.
-local function build_remap(entries, assignments, palette, ordered_ramps)
-    -- Map (ramp index in `ordered_ramps`, stop index) -> palette index.
-    local stop_to_pal = {}
-    for pi, p in ipairs(palette) do
-        if p.ramp > 0 then
-            stop_to_pal[p.ramp * 16 + p.stop] = pi - 1   -- 0-based palette index
-        end
-    end
-
-    -- Source ramp index -> ordered ramp index lookup is identity in our setup
-    -- because we build `ramps` in the same order as `assignments`.
-
+local function build_remap(entries, assignments, palette_entries, ordered_ramps, stop_to_pal)
     local remap = {}
     for i, e in ipairs(entries) do
         local ri = assignments[i]
@@ -530,6 +617,24 @@ local function build_remap(entries, assignments, palette, ordered_ramps)
         remap[e.key] = best_pi
     end
     return remap
+end
+
+-- Solve stops_per_chrom_ramp to hit target_colours budget, given grey reserve and shared anchors.
+-- palette_size = n_chrom * stops - savings + grey_stops + alpha_slot
+-- where savings = (shared_dark ? n_chrom-1 : 0) + (shared_light ? n_chrom-1 : 0)
+local function solve_stops_for_target(target, n_chrom, grey_stops, alpha_slot, shared_dark, shared_light)
+    if n_chrom == 0 then return 0 end
+    local alpha = alpha_slot and 1 or 0
+    local savings = 0
+    if n_chrom >= 2 then
+        if shared_dark then savings = savings + (n_chrom - 1) end
+        if shared_light then savings = savings + (n_chrom - 1) end
+    end
+    local remaining = target - grey_stops - alpha + savings
+    local stops = math.floor(remaining / n_chrom + 0.5)
+    if stops < 2 then stops = 2 end
+    if stops > 8 then stops = 8 end
+    return stops
 end
 
 -- ============================================================
@@ -555,6 +660,8 @@ local function parse_cli_params(cfg)
     end
 
     cfg.mode = str("mode") or cfg.mode
+    cfg.size_mode = str("size_mode") or cfg.size_mode
+    cfg.target_colours = num("target_colours") or cfg.target_colours
     cfg.ramps = num("ramps") or cfg.ramps
     cfg.stops = num("stops") or cfg.stops
     cfg.strength = num("strength") or cfg.strength
@@ -565,7 +672,9 @@ local function parse_cli_params(cfg)
     cfg.cool_attractor_hue = num("cool_attractor_hue") or cfg.cool_attractor_hue
     cfg.chroma_ceiling = num("chroma_ceiling") or cfg.chroma_ceiling
     cfg.achromatic_threshold = num("achromatic_threshold") or cfg.achromatic_threshold
+    cfg.grey_budget = num("grey_budget") or cfg.grey_budget
     local ss = bool("shared_shadow"); if ss ~= nil then cfg.shared_shadow = ss end
+    local sh = bool("shared_highlight"); if sh ~= nil then cfg.shared_highlight = sh end
     return cfg
 end
 
@@ -613,7 +722,7 @@ local function run(cfg)
         end
     end
 
-    -- 4. Decide ramp count
+    -- 4. Decide ramp count (from cfg or elbow)
     local target_ramps
     if cfg.ramps and cfg.ramps > 0 then
         target_ramps = math.floor(cfg.ramps)
@@ -630,7 +739,6 @@ local function run(cfg)
     local clusters, centroids = {}, {}
     if target_ramps > 0 then
         clusters, centroids = kmeans_hue(chromatic, target_ramps, cfg.kmeans_max_iter, cfg.kmeans_seed)
-        -- Drop empty clusters
         local kept_c, kept_h = {}, {}
         for j = 1, #clusters do
             if #clusters[j] >= 1 then
@@ -641,10 +749,24 @@ local function run(cfg)
         clusters, centroids = kept_c, kept_h
     end
 
-    -- 6. Build ramps
-    local stops_override = (cfg.stops and cfg.stops > 0) and math.floor(cfg.stops) or 0
+    -- 6. Decide stops per ramp.
+    -- If size_mode = "Total colours", solve from target_colours budget given shared-anchor savings.
+    local stops_override
+    if cfg.size_mode == "Total colours" then
+        local n_chrom = #clusters
+        local has_grey = #achromatic > 0
+        local grey_stops = has_grey and math.max(2, math.min(cfg.grey_stops_max, cfg.grey_budget)) or 0
+        stops_override = solve_stops_for_target(
+            cfg.target_colours, n_chrom, grey_stops, alpha_present,
+            cfg.shared_shadow, cfg.shared_highlight)
+        cfg._grey_stops_forced = grey_stops    -- pass to grey ramp builder below
+    else
+        stops_override = (cfg.stops and cfg.stops > 0) and math.floor(cfg.stops) or 0
+    end
+
+    -- 7. Build chromatic ramps
     local ramps = {}
-    local chromatic_assignments = {}    -- chromatic entry index -> ramp index in `ramps`
+    local chromatic_assignments = {}
     for j, cluster in ipairs(clusters) do
         ramps[#ramps + 1] = build_chromatic_ramp(chromatic, cluster, cfg, stops_override)
         for _, ci in ipairs(cluster) do
@@ -652,11 +774,19 @@ local function run(cfg)
         end
     end
 
+    -- 8. Apply shared anchors to chromatic ramps (mutates ramp stops in place)
+    local chrom_ramps = {}
+    for _, r in ipairs(ramps) do
+        if r.kind == "chromatic" then chrom_ramps[#chrom_ramps + 1] = r end
+    end
+    local shared_dark, shared_light = apply_shared_anchors(chrom_ramps, cfg)
+
+    -- 9. Build grey ramp
     if #achromatic > 0 then
-        -- Build grey ramp from indices
         local idx = {}
         for i = 1, #achromatic do idx[i] = i end
-        local grey = build_grey_ramp(achromatic, idx, cfg, stops_override)
+        local grey_stops_arg = cfg._grey_stops_forced or stops_override
+        local grey = build_grey_ramp(achromatic, idx, cfg, grey_stops_arg)
         if grey then
             ramps[#ramps + 1] = grey
         end
@@ -667,10 +797,11 @@ local function run(cfg)
         return
     end
 
-    -- 7. Flatten palette + ordering
-    local palette_entries, ordered_ramps = flatten_palette(ramps, alpha_present)
+    -- 10. Flatten palette
+    local palette_entries, ordered_ramps, stop_to_pal =
+        flatten_palette(ramps, alpha_present, shared_dark, shared_light)
 
-    -- Re-map original assignments to the (possibly reordered) ramp indices in `ordered_ramps`
+    -- 11. Re-map original assignments to (possibly reordered) ordered_ramps
     local ramp_to_ordered = {}
     for orig_i, r in ipairs(ramps) do
         for new_i, or_r in ipairs(ordered_ramps) do
@@ -678,9 +809,8 @@ local function run(cfg)
         end
     end
 
-    -- 8. Build assignments table over all source entries, then remap
-    local source_assignments = {}    -- entries-array index -> ordered ramp index
-    -- We need to map chromatic-list indices back to entries-list indices
+    -- 12. Build per-source assignments over `entries` array
+    local source_assignments = {}
     local chrom_to_entry = {}
     do
         local ci = 0
@@ -691,16 +821,13 @@ local function run(cfg)
             end
         end
     end
-    -- Grey ramp index in ordered_ramps (last one if exists)
     local grey_ordered_index = nil
     for i, r in ipairs(ordered_ramps) do
         if r.kind == "grey" then grey_ordered_index = i; break end
     end
     for ei, e in ipairs(entries) do
-        if e.C >= cfg.achromatic_threshold then
-            -- find chromatic index
-        else
-            if grey_ordered_index then source_assignments[ei] = grey_ordered_index end
+        if e.C < cfg.achromatic_threshold and grey_ordered_index then
+            source_assignments[ei] = grey_ordered_index
         end
     end
     for ci, ramp_idx in pairs(chromatic_assignments) do
@@ -708,7 +835,7 @@ local function run(cfg)
         source_assignments[ei] = ramp_to_ordered[ramp_idx]
     end
 
-    local remap = build_remap(entries, source_assignments, palette_entries, ordered_ramps)
+    local remap = build_remap(entries, source_assignments, palette_entries, ordered_ramps, stop_to_pal)
 
     -- 9. Apply: write new palette + remap pixels
     app.transaction(COMMAND_TITLE, function()
@@ -792,9 +919,26 @@ local function show_dialog()
     local dlg = Dialog(COMMAND_TITLE)
     dlg:combobox { id = "mode", label = "Mode", option = cfg.mode,
         options = { "Hybrid", "Stylise" } }
+    dlg:combobox {
+        id = "size_mode", label = "Size by", option = cfg.size_mode,
+        options = { "Ramps x Stops", "Total colours" },
+        onchange = function()
+            local d = dlg.data
+            local total = d.size_mode == "Total colours"
+            dlg:modify { id = "target_colours", visible = total }
+            dlg:modify { id = "stops", visible = not total }
+        end,
+    }
+    dlg:number { id = "target_colours", label = "Target colours",
+        text = tostring(cfg.target_colours), decimals = 0,
+        visible = cfg.size_mode == "Total colours" }
     dlg:number { id = "ramps", label = "Ramps (0 = auto)", text = tostring(cfg.ramps), decimals = 0 }
-    dlg:number { id = "stops", label = "Stops per ramp (0 = auto)", text = tostring(cfg.stops), decimals = 0 }
+    dlg:number { id = "stops", label = "Stops per ramp (0 = auto)",
+        text = tostring(cfg.stops), decimals = 0,
+        visible = cfg.size_mode ~= "Total colours" }
     dlg:slider { id = "strength", label = "Strength", min = 0, max = 100, value = round(cfg.strength * 100) }
+    dlg:check { id = "shared_shadow", label = "Share shadow anchor", selected = cfg.shared_shadow }
+    dlg:check { id = "shared_highlight", label = "Share highlight anchor", selected = cfg.shared_highlight }
     dlg:combobox { id = "output", label = "Output", option = cfg.output,
         options = { "New layer", "In place" } }
     dlg:separator()
@@ -806,9 +950,13 @@ local function show_dialog()
     if not data.apply then return end
 
     cfg.mode = data.mode
+    cfg.size_mode = data.size_mode
+    cfg.target_colours = data.target_colours or cfg.target_colours
     cfg.ramps = data.ramps or 0
     cfg.stops = data.stops or 0
     cfg.strength = (data.strength or 50) / 100.0
+    cfg.shared_shadow = data.shared_shadow
+    cfg.shared_highlight = data.shared_highlight
     cfg.output = data.output
     run(cfg)
 end

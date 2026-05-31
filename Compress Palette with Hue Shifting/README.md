@@ -29,9 +29,12 @@ aseprite -b ".\sprite.aseprite" `
 ## UI
 
 - **Mode** — `Hybrid` keeps the sprite's source hues and lightness range; `Stylise` forces strength = 1.0 (aggressive temperature shift, broader lightness range).
+- **Size by** — `Ramps x Stops` (specify both directly) or `Total colours` (specify a single budget like 32; stops-per-ramp is solved to hit it, accounting for shared anchors).
+- **Target colours** — total palette size when `Size by = Total colours`.
 - **Ramps** — number of hue ramps. `0` = auto (elbow method on hue WCSS).
-- **Stops per ramp** — colours per ramp. `0` = auto, derived from source lightness span.
+- **Stops per ramp** — colours per ramp when `Size by = Ramps x Stops`. `0` = auto, derived from source lightness span.
 - **Strength** — blends source-derived ramp parameters with the stylised reference (warm highlights / cool shadows). `0` = preserve source, `1` = full stylisation.
+- **Share shadow anchor** / **Share highlight anchor** — replace every chromatic ramp's darkest / brightest stop with one weighted-OKLab averaged colour, emitted once in the palette. Improves ramp cohesion and reduces palette size. Both on by default.
 - **Output** — `New layer` (non-destructive) or `In place` (rewrite all editable cels).
 
 ## CLI params
@@ -46,7 +49,9 @@ Visible UI params, plus:
 | `cool_attractor_hue`  | 250     | OKLCh degrees. Blue-violet by default. |
 | `chroma_ceiling`      | 0.30    | Hard chroma cap (sRGB gamut safety). |
 | `achromatic_threshold`| 0.02    | OKLab chroma below which a colour joins the grey ramp. |
-| `shared_shadow`       | false   | (Reserved) Merge all ramps' darkest stop to one anchor. |
+| `grey_budget`         | 3       | Grey ramp stops when achromatic colours are present and `size_mode = Total colours`. |
+| `shared_shadow`       | true    | Merge all chromatic ramps' darkest stop to one anchor. |
+| `shared_highlight`    | true    | Merge all chromatic ramps' brightest stop to one anchor. |
 | `raise_errors`        | false   | Convert UI alerts to thrown errors (for CLI / batch). |
 
 ## Pipeline
@@ -66,8 +71,7 @@ Visible UI params, plus:
 - RGB sprites only. Indexed and grayscale sprites are rejected with a clear message.
 - Treats all frames as one colour pool.
 - No dithering.
-- Output palette ordering is fixed (ramp-by-hue, dark-to-light). Not user-configurable yet.
-- `shared_shadow` parameter is reserved but not yet wired into the synthesis step.
+- Output palette ordering is fixed (shared dark anchor → ramps by hue ascending → shared light anchor → grey ramp). Not user-configurable yet.
 
 ## References
 

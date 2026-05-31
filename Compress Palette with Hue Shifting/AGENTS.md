@@ -35,7 +35,7 @@ aseprite -b ".\Tests\sample.aseprite" `
 
 ## Known issues / follow-ups
 - Indexed-mode support deferred (v0.1 rejects with a message).
-- `shared_shadow` parameter declared but not wired into ramp synthesis.
 - No animation-aware compression (all frames share one palette).
 - Performance not yet measured on large sprites; `image:pixels()` iteration may need replacement with `image.bytes` for big sources.
 - No preview mode; rely on `New layer` output for non-destructive evaluation.
+- `Total colours` budget solver may undershoot target slightly when the per-ramp stop count is clamped to the [2, 8] range.
