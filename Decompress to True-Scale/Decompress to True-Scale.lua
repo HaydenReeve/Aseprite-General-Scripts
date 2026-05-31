@@ -3474,27 +3474,65 @@ local function runScript()
     end
 end
 
--- Batch mode: skip dialog when running headless
+-- Batch mode: skip dialog when running headless.
+-- Default behaviour (no params): saves a sibling "<file> Output.png" with frame 1 only,
+-- preserving the legacy contract used by Tests/.
+-- Extended behaviour: when --script-param mode=in_place is supplied, processes all frames,
+-- optionally centre-pads the canvas to target=N (square), and saves back into the same
+-- aseprite file in place. This is intended for downstream pipelines that need a true
+-- multi-frame in-place True-Scale.
 if not app.isUIAvailable then
     local sprite = app.activeSprite
     if sprite then
         traceOpen()
-        trace("Batch mode started")
+        local params = app.params or {}
         local config = {}
         for k, v in pairs(DEFAULT_CONFIG) do config[k] = v end
-        config.kColors = 32
+        config.kColors = tonumber(params.kColors) or 32
 
-        local frameNumbers = { 1 }
-        local runOk, outputFrames, targetWidth, targetHeight, noOpReason = pcall(function()
-            return processFrames(sprite, frameNumbers, config)
-        end)
+        local mode = params.mode or "legacy"
+        trace("Batch mode started: " .. mode)
 
-        if runOk and outputFrames and outputFrames[1] then
-            replaceSpriteContents(sprite, outputFrames, targetWidth, targetHeight)
-            sprite:saveCopyAs(sprite.filename:gsub("%.aseprite$", " Output.png"))
-            trace("Batch mode: saved output")
+        if mode == "in_place" then
+            local frameNumbers = {}
+            for frameNumber = 1, #sprite.frames do
+                frameNumbers[#frameNumbers + 1] = frameNumber
+            end
+            trace("Processing " .. #frameNumbers .. " frames (in_place)")
+
+            local runOk, outputFrames, targetWidth, targetHeight = pcall(function()
+                return processFrames(sprite, frameNumbers, config)
+            end)
+
+            if runOk and outputFrames and outputFrames[1] then
+                replaceSpriteContents(sprite, outputFrames, targetWidth, targetHeight)
+            else
+                trace("processFrames returned no output; falling back to existing canvas")
+            end
+
+            local target = tonumber(params.target)
+            if target and target > 0 then
+                local dx = math.floor((target - sprite.width) / 2)
+                local dy = math.floor((target - sprite.height) / 2)
+                sprite:crop(Rectangle(-dx, -dy, target, target))
+                trace("Centre-padded to " .. target .. "x" .. target)
+            end
+
+            sprite:saveAs(sprite.filename)
+            trace("Saved aseprite in place")
         else
-            trace("Batch mode ERROR: " .. tostring(outputFrames))
+            local frameNumbers = { 1 }
+            local runOk, outputFrames, targetWidth, targetHeight = pcall(function()
+                return processFrames(sprite, frameNumbers, config)
+            end)
+
+            if runOk and outputFrames and outputFrames[1] then
+                replaceSpriteContents(sprite, outputFrames, targetWidth, targetHeight)
+                sprite:saveCopyAs(sprite.filename:gsub("%.aseprite$", " Output.png"))
+                trace("Batch mode: saved output")
+            else
+                trace("Batch mode ERROR: " .. tostring(outputFrames))
+            end
         end
         traceClose()
     end
