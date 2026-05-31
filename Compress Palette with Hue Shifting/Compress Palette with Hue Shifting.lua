@@ -411,7 +411,7 @@ local function build_chromatic_ramp(entries, cluster_indices, cfg, stops_overrid
         elseif span >= 0.15 then n = 3
         else n = 2 end
     end
-    n = clamp(n, 2, 8)
+    n = clamp(n, 2, 16)
 
     local stops = {}
     for k = 1, n do
@@ -566,7 +566,7 @@ local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
     if use_shared_dark then
         shared_dark_pi = emit(shared_dark.r, shared_dark.g, shared_dark.b, -1, -1)
         for ri = 1, n_chrom do
-            stop_to_pal[ri * 16 + 1] = shared_dark_pi
+            stop_to_pal[ri * 64 + 1] = shared_dark_pi
         end
     end
 
@@ -577,14 +577,14 @@ local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
         local last = use_shared_light and (n - 1) or n
         for si = first, last do
             local s = ramp.stops[si]
-            stop_to_pal[ri * 16 + si] = emit(s.r, s.g, s.b, ri, si)
+            stop_to_pal[ri * 64 + si] = emit(s.r, s.g, s.b, ri, si)
         end
     end
 
     if use_shared_light then
         shared_light_pi = emit(shared_light.r, shared_light.g, shared_light.b, -1, -1)
         for ri = 1, n_chrom do
-            stop_to_pal[ri * 16 + #chroma[ri].stops] = shared_light_pi
+            stop_to_pal[ri * 64 + #chroma[ri].stops] = shared_light_pi
         end
     end
 
@@ -593,7 +593,7 @@ local function flatten_palette(ramps, alpha_present, shared_dark, shared_light)
     for gi, r in ipairs(grey) do
         local ri = grey_offset + gi
         for si, s in ipairs(r.stops) do
-            stop_to_pal[ri * 16 + si] = emit(s.r, s.g, s.b, ri, si)
+            stop_to_pal[ri * 64 + si] = emit(s.r, s.g, s.b, ri, si)
         end
     end
 
@@ -611,7 +611,7 @@ local function build_remap(entries, assignments, palette_entries, ordered_ramps,
             local d2 = oklab_d2(e.L, e.A, e.B, L, A, B)
             if d2 < best_d2 then
                 best_d2 = d2
-                best_pi = stop_to_pal[ri * 16 + si] or 0
+                best_pi = stop_to_pal[ri * 64 + si] or 0
             end
         end
         remap[e.key] = best_pi
@@ -622,8 +622,11 @@ end
 -- Solve stops_per_chrom_ramp to hit target_colours budget, given grey reserve and shared anchors.
 -- palette_size = n_chrom * stops - savings + grey_stops + alpha_slot
 -- where savings = (shared_dark ? n_chrom-1 : 0) + (shared_light ? n_chrom-1 : 0)
-local function solve_stops_for_target(target, n_chrom, grey_stops, alpha_slot, shared_dark, shared_light)
-    if n_chrom == 0 then return 0 end
+-- Returns: base_stops (int), per_ramp_extra (table of additional stops for ramps with widest L-span).
+local STOPS_HARD_CAP <const> = 16
+
+local function solve_stops_for_target(target, n_chrom, grey_stops, alpha_slot, shared_dark, shared_light, chrom_ramp_lspans)
+    if n_chrom == 0 then return 0, {} end
     local alpha = alpha_slot and 1 or 0
     local savings = 0
     if n_chrom >= 2 then
@@ -631,10 +634,41 @@ local function solve_stops_for_target(target, n_chrom, grey_stops, alpha_slot, s
         if shared_light then savings = savings + (n_chrom - 1) end
     end
     local remaining = target - grey_stops - alpha + savings
-    local stops = math.floor(remaining / n_chrom + 0.5)
-    if stops < 2 then stops = 2 end
-    if stops > 8 then stops = 8 end
-    return stops
+    local base = math.floor(remaining / n_chrom + 0.5)
+    if base < 2 then base = 2 end
+    if base > STOPS_HARD_CAP then base = STOPS_HARD_CAP end
+
+    -- Allocate leftover budget to ramps with widest source L-span.
+    local extra = {}
+    for i = 1, n_chrom do extra[i] = 0 end
+    if not chrom_ramp_lspans then return base, extra end
+
+    local function palette_size_for(base_n, extras)
+        local total_stops = 0
+        for i = 1, n_chrom do total_stops = total_stops + base_n + extras[i] end
+        return total_stops - savings + grey_stops + alpha
+    end
+
+    -- Indices sorted by descending L-span
+    local order = {}
+    for i = 1, n_chrom do order[i] = i end
+    table.sort(order, function(a, b) return chrom_ramp_lspans[a] > chrom_ramp_lspans[b] end)
+
+    local guard = 0
+    while palette_size_for(base, extra) < target and guard < n_chrom * STOPS_HARD_CAP do
+        local progressed = false
+        for _, ri in ipairs(order) do
+            if base + extra[ri] < STOPS_HARD_CAP then
+                extra[ri] = extra[ri] + 1
+                progressed = true
+                if palette_size_for(base, extra) >= target then break end
+            end
+        end
+        if not progressed then break end
+        guard = guard + 1
+    end
+
+    return base, extra
 end
 
 -- ============================================================
@@ -752,14 +786,29 @@ local function run(cfg)
     -- 6. Decide stops per ramp.
     -- If size_mode = "Total colours", solve from target_colours budget given shared-anchor savings.
     local stops_override
+    local per_ramp_extra = nil
     if cfg.size_mode == "Total colours" then
         local n_chrom = #clusters
         local has_grey = #achromatic > 0
         local grey_stops = has_grey and math.max(2, math.min(cfg.grey_stops_max, cfg.grey_budget)) or 0
-        stops_override = solve_stops_for_target(
+        -- Pre-compute each cluster's source lightness span so the solver can prefer
+        -- ramps with the widest range when distributing leftover budget.
+        local lspans = {}
+        for ci, cluster in ipairs(clusters) do
+            local lo, hi = math.huge, -math.huge
+            for _, idx in ipairs(cluster) do
+                local L = chromatic[idx].L
+                if L < lo then lo = L end
+                if L > hi then hi = L end
+            end
+            lspans[ci] = hi - lo
+        end
+        local base
+        base, per_ramp_extra = solve_stops_for_target(
             cfg.target_colours, n_chrom, grey_stops, alpha_present,
-            cfg.shared_shadow, cfg.shared_highlight)
-        cfg._grey_stops_forced = grey_stops    -- pass to grey ramp builder below
+            cfg.shared_shadow, cfg.shared_highlight, lspans)
+        stops_override = base
+        cfg._grey_stops_forced = grey_stops
     else
         stops_override = (cfg.stops and cfg.stops > 0) and math.floor(cfg.stops) or 0
     end
@@ -768,7 +817,11 @@ local function run(cfg)
     local ramps = {}
     local chromatic_assignments = {}
     for j, cluster in ipairs(clusters) do
-        ramps[#ramps + 1] = build_chromatic_ramp(chromatic, cluster, cfg, stops_override)
+        local stops_for_this = stops_override
+        if per_ramp_extra and per_ramp_extra[j] then
+            stops_for_this = stops_override + per_ramp_extra[j]
+        end
+        ramps[#ramps + 1] = build_chromatic_ramp(chromatic, cluster, cfg, stops_for_this)
         for _, ci in ipairs(cluster) do
             chromatic_assignments[ci] = #ramps
         end

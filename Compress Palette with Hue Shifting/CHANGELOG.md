@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3 — Total-colours undershoot fix
+
+- Per-ramp stop cap raised from 8 to 16 (was choking the budget when ramp count was small, producing palettes far below the requested target).
+- `Total colours` solver now distributes leftover budget to ramps with the widest source lightness span before clamping. Ramps that cover broader tonal range get more stops; flatter ramps stay compact.
+- Internal `stop_to_pal` key spacing widened to accommodate the higher per-ramp cap.
+
 ## v0.2 — Iteration
 
 - **Total-colours sizing**. New `Size by` toggle: pick a single target palette size (e.g. 32) instead of ramps × stops. `stops_per_ramp` is solved from the budget, accounting for shared-anchor savings.
