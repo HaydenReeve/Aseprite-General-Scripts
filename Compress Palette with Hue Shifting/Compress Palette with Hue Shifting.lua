@@ -1,4 +1,4 @@
--- Compress Palette with Hue Shifting V0.7
+-- Compress Palette with Hue Shifting V0.8
 -- Install:
 -- 1. Save this file as "Compress Palette with Hue Shifting.lua".
 -- 2. Copy or symlink it (and its folder) into %APPDATA%\Aseprite\scripts.
@@ -36,6 +36,7 @@ local DEFAULT_CONFIG <const> = {
     accent_score_threshold = 0.80,
     accent_tolerance = 0.04,        -- OKLab ΔE below which accent is considered already represented
     accent_cluster_floor = 0.06,    -- absolute OKLCh chroma below which per-cluster outliers are ignored
+    sparse_cluster_chroma_gate = 0.10, -- max chroma a sparse cluster needs to qualify for promotion (vs `accent_cluster_floor` which gates individual members)
     -- Pixel-art contrast preservation
     preserve_contrast = true,        -- when true: per-ramp distinct tops + lower bleach + warmer extremes
     contrast_l_hi_abs = 0.86,        -- absolute highlight L cap when preserve_contrast = true (vs 0.92 default)
@@ -710,6 +711,55 @@ local function promote_cluster_outliers(clusters, chrom_pool, slots_remaining, p
     return promoted
 end
 
+-- Promote sparse high-chroma clusters (e.g. a 2-pixel saturated eye colour) to
+-- accents BEFORE ramp synthesis, so the source colour renders verbatim instead
+-- of being remapped to a desaturated synthesised stop. Complements
+-- `promote_cluster_outliers` which only fires for clusters of size >= 3 with
+-- per-cluster outliers; this pass targets tiny clusters that would otherwise
+-- get a full synthesised ramp.
+--
+-- Qualification: `#cluster <= 3`, total cluster pixel weight below
+-- `mass_cap`, AND max member chroma >= `cluster_gate`. Members with chroma
+-- >= `member_floor` are emitted as verbatim accents.
+local function promote_sparse_clusters(clusters, chrom_pool, slots_remaining,
+                                       mass_cap, cluster_gate, member_floor)
+    if slots_remaining <= 0 then return {} end
+    local promoted = {}
+    local removals = {}
+    for ci, cluster in ipairs(clusters) do
+        if #cluster > 0 and #cluster <= 6 then
+            local total_w, max_c = 0, 0
+            for _, idx in ipairs(cluster) do
+                local e = chrom_pool[idx]
+                total_w = total_w + e.w
+                if e.C > max_c then max_c = e.C end
+            end
+            if total_w <= mass_cap and max_c >= cluster_gate then
+                for ii, idx in ipairs(cluster) do
+                    if #promoted >= slots_remaining then break end
+                    local e = chrom_pool[idx]
+                    if e.C >= member_floor then
+                        local copy = {}
+                        for k, v in pairs(e) do copy[k] = v end
+                        copy.verbatim = true
+                        promoted[#promoted + 1] = copy
+                        removals[ci] = removals[ci] or {}
+                        removals[ci][ii] = true
+                    end
+                end
+            end
+        end
+    end
+    for ci, drop_set in pairs(removals) do
+        local kept = {}
+        for ii, idx in ipairs(clusters[ci]) do
+            if not drop_set[ii] then kept[#kept + 1] = idx end
+        end
+        clusters[ci] = kept
+    end
+    return promoted
+end
+
 -- Build palette index for output. Shared anchors emitted once; (ramp, endpoint) pairs map to the shared index.
 -- Returns: entries (palette), ordered_ramps, stop_to_pal map, accent_key_to_pi.
 local function flatten_palette(ramps, alpha_present, shared_dark, shared_light, accents, accent_tolerance)
@@ -785,7 +835,7 @@ local function flatten_palette(ramps, alpha_present, shared_dark, shared_light, 
         for _, ae in ipairs(accents) do
             local rk = ae.r * 65536 + ae.g * 256 + ae.b
             local match_pi = rgb_to_pi[rk]
-            if match_pi == nil then
+            if match_pi == nil and not ae.verbatim then
                 local best_d2 = math.huge
                 for pi_zero = 0, #entries - 1 do
                     local pe = entries[pi_zero + 1]
@@ -936,6 +986,7 @@ local function parse_cli_params(cfg)
     cfg.accent_score_threshold = num("accent_score_threshold") or cfg.accent_score_threshold
     cfg.accent_tolerance = num("accent_tolerance") or cfg.accent_tolerance
     cfg.accent_cluster_floor = num("accent_cluster_floor") or cfg.accent_cluster_floor
+    cfg.sparse_cluster_chroma_gate = num("sparse_cluster_chroma_gate") or cfg.sparse_cluster_chroma_gate
     local pc_flag = bool("preserve_contrast"); if pc_flag ~= nil then cfg.preserve_contrast = pc_flag end
     cfg.contrast_l_hi_abs = num("contrast_l_hi_abs") or cfg.contrast_l_hi_abs
     cfg.contrast_highlight_bell_floor = num("contrast_highlight_bell_floor") or cfg.contrast_highlight_bell_floor
@@ -1085,7 +1136,38 @@ local function run(cfg)
         clusters, centroids = kept_c, kept_h
     end
 
-    -- 5b. Per-cluster outlier promotion: catches vivid colours bucketed into a
+    -- 5b. Sparse-cluster promotion: a vivid-but-rare colour cluster (e.g. an eye
+    -- highlight comprising 2 saturated greens) would otherwise be synthesised
+    -- into a full ramp and the source pixels remapped to a desaturated stop.
+    -- Promoting all members to verbatim accents preserves the original colour
+    -- and frees a ramp slot.
+    if cfg.accent_detection and #clusters > 0 then
+        local slots_left = cfg.max_accent_slots - #accents
+        -- Cap sparse promotion so per-cluster outlier promotion still has room.
+        local sparse_cap = math.max(0, math.min(slots_left, math.max(2, math.floor(slots_left * 0.5))))
+        if sparse_cap > 0 then
+            local mass_cap = math.min(total_opaque * 0.02, 64)
+            local promoted_sparse = promote_sparse_clusters(
+                clusters, chrom_for_cluster, sparse_cap,
+                mass_cap, cfg.sparse_cluster_chroma_gate, cfg.accent_cluster_floor)
+            for _, e in ipairs(promoted_sparse) do
+                if not accent_key_set[e.key] then
+                    accents[#accents + 1] = e
+                    accent_key_set[e.key] = true
+                end
+            end
+            local kept_c, kept_h = {}, {}
+            for j = 1, #clusters do
+                if #clusters[j] >= 1 then
+                    kept_c[#kept_c + 1] = clusters[j]
+                    kept_h[#kept_h + 1] = centroids[j]
+                end
+            end
+            clusters, centroids = kept_c, kept_h
+        end
+    end
+
+    -- 5c. Per-cluster outlier promotion: catches vivid colours bucketed into a
     -- hue-neighbouring ramp (e.g. red eye dropped into a brown ramp) that would
     -- otherwise be averaged out by the cluster's chroma percentile.
     if cfg.accent_detection and #clusters > 0 then

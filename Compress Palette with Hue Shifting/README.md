@@ -58,7 +58,8 @@ Visible UI params, plus:
 | `accent_detection`    | true    | Enable rare-or-vivid accent preservation. |
 | `max_accent_slots`    | 8       | Maximum palette entries reserved for accents. |
 | `accent_score_threshold` | 0.55 | Combined chroma + visibility score threshold for accent eligibility. |
-| `accent_cluster_floor`| 0.10    | OKLCh chroma below which per-cluster outliers will not be promoted to accents. |
+| `accent_cluster_floor`| 0.06    | OKLCh chroma below which per-cluster outliers will not be promoted to accents (also the per-member floor for sparse-cluster promotion). |
+| `sparse_cluster_chroma_gate` | 0.10 | A cluster qualifies for sparse promotion only if at least one member's chroma reaches this gate. Higher values keep modestly chromatic small clusters as ramps. |
 | `accent_tolerance`    | 0.04    | OKLab ΔE; accents closer than this to an existing palette entry reuse it instead of emitting a duplicate. |
 | `preserve_contrast`   | true    | Disable shared highlight, lower highlight L cap, raise highlight chroma-bell floor. Keeps adjacent regions distinguishable. |
 | `contrast_l_hi_abs`   | 0.86    | Highlight L cap when `preserve_contrast = true`. Lower values keep ramp tops more saturated. |

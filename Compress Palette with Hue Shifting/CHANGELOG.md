@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8 — Sparse-cluster accent promotion
+
+- **Tiny vivid clusters now render verbatim instead of being synthesised into a desaturated ramp.** A 2-pixel saturated eye-green (`#37946E`) was previously bucketed by k-means into its own hue cluster, given a full 7-stop ramp, and the source pixels remapped to a desaturated synthesised stop (`#659979`), reading as hazel. The new `promote_sparse_clusters` pass detects clusters that have at most 6 unique members AND total pixel weight ≤ `min(2% of opaque, 64)` AND max member chroma ≥ `sparse_cluster_chroma_gate` (0.10), then promotes every member with chroma ≥ `accent_cluster_floor` (0.06) to a verbatim accent. The cluster is dropped, freeing a ramp slot.
+- **`verbatim` accents bypass `accent_tolerance` deduping** in `flatten_palette` so a sparse-promoted source colour can never be merged into a near-by ramp stop. Exact-RGB matching against existing palette entries is still honoured (no duplicate emission).
+- **Slot budget is balanced.** Sparse promotion is capped at `floor(slots_left × 0.5)` (minimum 2) so per-cluster outlier promotion still has room to rescue accents from inside larger clusters.
+- **CLI:** new `sparse_cluster_chroma_gate` param. The existing `accent_cluster_floor` is reused as the per-member threshold.
+
 ## v0.7 — Pixel-art contrast preservation
 
 - **`Preserve contrast` toggle (default ON).** Adjacent regions with different identities (e.g. warm skin vs neutral shirt) were collapsing into visually similar near-white blobs because each chromatic ramp's top stop was being shared into one weighted-average light entry with OKLab ΔE ≈ 0.025 from the grey ramp's top. The toggle disables `shared_highlight` for the run so each chromatic ramp keeps its own distinct top, lowers `L_hi_abs` from 0.92 to 0.86 so warm tops stay coloured rather than bleached, and asymmetrically raises the highlight-side chroma-bell floor from 0.25 to 0.45 so ramp tops carry their hue identity. The shadow side is unchanged so darks don't pick up a coloured rim.
