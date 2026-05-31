@@ -54,10 +54,10 @@ Visible UI params, plus:
 | `grey_budget`         | 3       | Grey ramp stops when achromatic colours are present and `size_mode = Total colours`. |
 | `shared_shadow`       | true    | Merge all chromatic ramps' darkest stop to one anchor. |
 | `shared_highlight`    | true    | Merge all chromatic ramps' brightest stop to one anchor. |
-| `accent_detection`    | true    | Enable rare + high-chroma accent preservation. |
-| `max_accent_slots`    | 4       | Maximum palette entries reserved for accents. |
-| `accent_chroma_mad`   | 2.5     | MAD multiplier for the chroma outlier test. Higher = fewer accents detected. |
-| `accent_score_threshold` | 0.55 | Combined chroma + rarity score threshold for accent eligibility. |
+| `accent_detection`    | true    | Enable rare-or-vivid accent preservation. |
+| `max_accent_slots`    | 8       | Maximum palette entries reserved for accents. |
+| `accent_score_threshold` | 0.55 | Combined chroma + visibility score threshold for accent eligibility. |
+| `accent_cluster_floor`| 0.10    | OKLCh chroma below which per-cluster outliers will not be promoted to accents. |
 | `accent_tolerance`    | 0.07    | OKLab ΔE; accents closer than this to an existing palette entry reuse it instead of emitting a duplicate. |
 | `raise_errors`        | false   | Convert UI alerts to thrown errors (for CLI / batch). |
 

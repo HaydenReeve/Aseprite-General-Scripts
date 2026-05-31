@@ -32,10 +32,10 @@ local DEFAULT_CONFIG <const> = {
     grey_stops_max = 5,
     -- Accent preservation
     accent_detection = true,
-    max_accent_slots = 4,
-    accent_chroma_mad = 2.5,
+    max_accent_slots = 8,
     accent_score_threshold = 0.55,
-    accent_tolerance = 0.07,        -- OKLab ΔE threshold for "already represented"
+    accent_tolerance = 0.07,        -- OKLab ΔE below which accent is considered already represented
+    accent_cluster_floor = 0.10,    -- absolute OKLCh chroma below which per-cluster outliers are ignored
 }
 
 local pc <const> = app.pixelColor
@@ -400,7 +400,18 @@ local function build_chromatic_ramp(entries, cluster_indices, cfg, stops_overrid
     local L_lo = lerp(L_lo_src, L_lo_abs, s)
     local L_hi = lerp(L_hi_src, L_hi_abs, s)
 
-    local C_base = percentile({ table.unpack(Cs) }, 0.75)
+    -- C_base from a high percentile (P90) so cluster vibrancy survives the bell curve.
+    -- For small clusters where P90 collapses to the max, fall back to P75 to avoid
+    -- a single residual outlier blowing the ramp out (per-cluster promotion has
+    -- already stripped the strongest outliers upstream).
+    local cs_sorted = { table.unpack(Cs) }
+    table.sort(cs_sorted)
+    local C_base
+    if #cs_sorted >= 8 then
+        C_base = percentile(cs_sorted, 0.90)
+    else
+        C_base = percentile(cs_sorted, 0.75)
+    end
     C_base = math.min(C_base, cfg.chroma_ceiling)
     if C_base < 0.01 then C_base = 0.01 end
 
@@ -535,14 +546,14 @@ local function oklab_d2(L1, a1, b1, L2, a2, b2)
 end
 
 -- ============================================================
--- Accent detection (rare + high-chroma colours preserved as standalone palette entries)
+-- Accent detection (rare-or-vivid colours preserved as standalone palette entries)
 -- ============================================================
 
--- Compute combined salience (chroma MAD + rarity) for chromatic entries.
+-- Compute combined salience (chroma MAD + visibility) for chromatic entries.
 -- Returns: scores[i] in [0,1] per chromatic index, or nil if input too small/degenerate.
-local function compute_accent_scores(chromatic, k_mad)
+local function compute_accent_scores(chromatic, total_pixels)
     local n = #chromatic
-    if n < 4 then return nil end                    -- need a reasonable distribution
+    if n < 4 then return nil end
 
     -- Median + MAD of chroma
     local cs = {}
@@ -556,28 +567,36 @@ local function compute_accent_scores(chromatic, k_mad)
     local mid2 = math.floor(n / 2)
     local mad = (n % 2 == 1) and devs[mid2 + 1] or (devs[mid2] + devs[mid2 + 1]) * 0.5
     local sigma_hat = 1.4826 * mad
-    if sigma_hat < 1e-4 then sigma_hat = 1e-4 end   -- guard flat distributions
+    if sigma_hat < 1e-4 then sigma_hat = 1e-4 end
 
-    -- Rarity normaliser
+    -- Visibility normaliser
     local max_w = 1
     for i = 1, n do if chromatic[i].w > max_w then max_w = chromatic[i].w end end
     local log_denom = math.log(max_w + 1)
     if log_denom < 1e-6 then log_denom = 1e-6 end
 
+    -- Upper frequency guard: ignore very common colours (≥ 15% of opaque pixels);
+    -- those belong in ramps, not as standalone accents.
+    local common_cutoff = math.max(1, total_pixels * 0.15)
+    -- Pixel floor: skip 1-pixel noise on larger sprites; preserve singletons on tiny sprites.
+    local pixel_floor = (total_pixels < 512) and 1 or math.max(2, math.ceil(total_pixels / 2000))
+
     local scores = {}
     for i = 1, n do
         local e = chromatic[i]
-        local z = (e.C - median_c) / sigma_hat
-        local S_c = math.max(0, math.min(1, z / 3.0))
-        local S_r = 1.0 - math.log(e.w + 1) / log_denom
-        if S_r < 0 then S_r = 0 end
-        scores[i] = 0.6 * S_c + 0.4 * S_r
+        if e.w < pixel_floor or e.w >= common_cutoff then
+            scores[i] = 0
+        else
+            local z = (e.C - median_c) / sigma_hat
+            local S_c = math.max(0, math.min(1, z / 3.0))
+            local importance = math.log(e.w + 1) / log_denom
+            scores[i] = 0.65 * S_c + 0.35 * importance
+        end
     end
     return scores
 end
 
 -- Pick the highest-salience entries above threshold, capped by max_slots.
--- Returns an array of accent entries (objects from `chromatic`) and a set of their keys.
 local function select_accents(chromatic, scores, threshold, max_slots)
     if not scores or max_slots <= 0 then return {}, {} end
     local order = {}
@@ -607,6 +626,55 @@ local function partition_accents(chromatic, accent_key_set)
         end
     end
     return filtered, to_orig
+end
+
+-- Promote per-cluster chroma outliers to the accent list. The eye-red case: a vivid
+-- colour folded into a hue-neighbouring brown ramp would otherwise dilute the cluster's
+-- C_base and lose its punch. This pass strips those entries before ramp synthesis.
+-- Mutates `clusters` (removes promoted indices) and returns a list of promoted entries.
+local function promote_cluster_outliers(clusters, chrom_pool, slots_remaining, pixel_floor, abs_chroma_floor)
+    if slots_remaining <= 0 then return {} end
+    -- Collect all per-cluster candidates globally so the best score wins, not the earliest cluster.
+    local candidates = {}     -- { ci, idx_in_cluster, entry, score }
+    for ci, cluster in ipairs(clusters) do
+        if #cluster >= 3 then
+            local cs = {}
+            for _, idx in ipairs(cluster) do cs[#cs + 1] = chrom_pool[idx].C end
+            table.sort(cs)
+            local mid = math.floor(#cs / 2)
+            local med = (#cs % 2 == 1) and cs[mid + 1] or (cs[mid] + cs[mid + 1]) * 0.5
+            local threshold = math.max(abs_chroma_floor, med * 1.8)
+            for ii, idx in ipairs(cluster) do
+                local e = chrom_pool[idx]
+                if e.C > threshold and e.w >= pixel_floor then
+                    -- Score: chroma magnitude × log visibility (in-cluster importance)
+                    local score = e.C * (1.0 + math.log(1 + e.w))
+                    candidates[#candidates + 1] = {
+                        ci = ci, ii = ii, idx = idx, entry = e, score = score,
+                    }
+                end
+            end
+        end
+    end
+    if #candidates == 0 then return {} end
+    table.sort(candidates, function(a, b) return a.score > b.score end)
+    local promoted = {}
+    local removals = {}   -- ci -> set of ii's to drop
+    for k = 1, math.min(slots_remaining, #candidates) do
+        local c = candidates[k]
+        promoted[#promoted + 1] = c.entry
+        removals[c.ci] = removals[c.ci] or {}
+        removals[c.ci][c.ii] = true
+    end
+    -- Rebuild affected clusters without the promoted indices.
+    for ci, drop_set in pairs(removals) do
+        local new_cluster = {}
+        for ii, idx in ipairs(clusters[ci]) do
+            if not drop_set[ii] then new_cluster[#new_cluster + 1] = idx end
+        end
+        clusters[ci] = new_cluster
+    end
+    return promoted
 end
 
 -- Build palette index for output. Shared anchors emitted once; (ramp, endpoint) pairs map to the shared index.
@@ -832,9 +900,9 @@ local function parse_cli_params(cfg)
     local sh = bool("shared_highlight"); if sh ~= nil then cfg.shared_highlight = sh end
     local ad = bool("accent_detection"); if ad ~= nil then cfg.accent_detection = ad end
     cfg.max_accent_slots = num("max_accent_slots") or cfg.max_accent_slots
-    cfg.accent_chroma_mad = num("accent_chroma_mad") or cfg.accent_chroma_mad
     cfg.accent_score_threshold = num("accent_score_threshold") or cfg.accent_score_threshold
     cfg.accent_tolerance = num("accent_tolerance") or cfg.accent_tolerance
+    cfg.accent_cluster_floor = num("accent_cluster_floor") or cfg.accent_cluster_floor
     return cfg
 end
 
@@ -882,12 +950,15 @@ local function run(cfg)
         end
     end
 
-    -- 3b. Accent detection: identify rare + high-chroma colours to preserve verbatim.
+    -- 3b. Accent detection: identify rare-or-vivid colours to preserve verbatim.
+    local total_opaque = 0
+    for _, e in ipairs(entries) do total_opaque = total_opaque + e.w end
+    local pixel_floor = (total_opaque < 512) and 1 or math.max(2, math.ceil(total_opaque / 2000))
+
     local accents, accent_key_set = {}, {}
     if cfg.accent_detection and cfg.max_accent_slots and cfg.max_accent_slots > 0 then
-        local scores = compute_accent_scores(chromatic, cfg.accent_chroma_mad)
+        local scores = compute_accent_scores(chromatic, total_opaque)
         if scores then
-            -- Reserve at most floor((n-1)/3) slots so we always leave room for ramps.
             local hard_cap = math.max(0, math.floor((#chromatic - 1) / 3))
             local cap = math.min(cfg.max_accent_slots, hard_cap)
             accents, accent_key_set = select_accents(chromatic, scores, cfg.accent_score_threshold, cap)
@@ -952,6 +1023,33 @@ local function run(cfg)
             end
         end
         clusters, centroids = kept_c, kept_h
+    end
+
+    -- 5b. Per-cluster outlier promotion: catches vivid colours bucketed into a
+    -- hue-neighbouring ramp (e.g. red eye dropped into a brown ramp) that would
+    -- otherwise be averaged out by the cluster's chroma percentile.
+    if cfg.accent_detection and #clusters > 0 then
+        local slots_left = cfg.max_accent_slots - #accents
+        if slots_left > 0 then
+            local promoted = promote_cluster_outliers(
+                clusters, chrom_for_cluster, slots_left,
+                pixel_floor, cfg.accent_cluster_floor)
+            for _, e in ipairs(promoted) do
+                if not accent_key_set[e.key] then
+                    accents[#accents + 1] = e
+                    accent_key_set[e.key] = true
+                end
+            end
+            -- Drop any clusters that emptied out after promotion.
+            local kept_c, kept_h = {}, {}
+            for j = 1, #clusters do
+                if #clusters[j] >= 1 then
+                    kept_c[#kept_c + 1] = clusters[j]
+                    kept_h[#kept_h + 1] = centroids[j]
+                end
+            end
+            clusters, centroids = kept_c, kept_h
+        end
     end
 
     -- 6. Decide stops per ramp.
@@ -1172,8 +1270,6 @@ local function show_dialog()
         text = tostring(cfg.stops), decimals = 0,
         visible = cfg.size_mode ~= "Total colours" }
     dlg:slider { id = "strength", label = "Strength", min = 0, max = 100, value = round(cfg.strength * 100) }
-    dlg:check { id = "shared_shadow", label = "Share shadow anchor", selected = cfg.shared_shadow }
-    dlg:check { id = "shared_highlight", label = "Share highlight anchor", selected = cfg.shared_highlight }
     dlg:separator { text = "Accent preservation" }
     dlg:check { id = "accent_detection", label = "Preserve accents",
         selected = cfg.accent_detection,
@@ -1185,6 +1281,7 @@ local function show_dialog()
     dlg:number { id = "max_accent_slots", label = "Accent slots",
         text = tostring(cfg.max_accent_slots), decimals = 0,
         visible = cfg.accent_detection }
+    dlg:separator()
     dlg:combobox { id = "output", label = "Output", option = cfg.output,
         options = { "New layer", "In place" } }
     dlg:separator()
@@ -1201,8 +1298,6 @@ local function show_dialog()
     cfg.ramps = data.ramps or 0
     cfg.stops = data.stops or 0
     cfg.strength = (data.strength or 50) / 100.0
-    cfg.shared_shadow = data.shared_shadow
-    cfg.shared_highlight = data.shared_highlight
     cfg.accent_detection = data.accent_detection
     cfg.max_accent_slots = data.max_accent_slots or cfg.max_accent_slots
     cfg.output = data.output
