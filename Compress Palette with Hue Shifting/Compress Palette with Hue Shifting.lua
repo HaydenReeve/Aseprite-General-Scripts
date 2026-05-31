@@ -1,4 +1,4 @@
--- Compress Palette with Hue Shifting V0.1
+-- Compress Palette with Hue Shifting V0.6
 -- Install:
 -- 1. Save this file as "Compress Palette with Hue Shifting.lua".
 -- 2. Copy or symlink it (and its folder) into %APPDATA%\Aseprite\scripts.
@@ -33,9 +33,9 @@ local DEFAULT_CONFIG <const> = {
     -- Accent preservation
     accent_detection = true,
     max_accent_slots = 8,
-    accent_score_threshold = 0.55,
+    accent_score_threshold = 0.80,
     accent_tolerance = 0.07,        -- OKLab ΔE below which accent is considered already represented
-    accent_cluster_floor = 0.10,    -- absolute OKLCh chroma below which per-cluster outliers are ignored
+    accent_cluster_floor = 0.06,    -- absolute OKLCh chroma below which per-cluster outliers are ignored
 }
 
 local pc <const> = app.pixelColor
@@ -211,33 +211,41 @@ end
 -- Sprite pixel collection
 -- ============================================================
 
+-- Walk every frame's *composited* output. This matches what an exporter sees
+-- and prevents hidden/overpainted cel pixels from polluting the histogram.
+-- A colour appearing on multiple frames is counted on each frame, naturally
+-- weighting frame-stable colours over single-frame AA noise. We also track
+-- the number of distinct frames each colour appears on so accent scoring can
+-- reward frame-consistent vivid colours.
 local function collect_histogram(sprite)
-    local hist = {}                  -- key = packed rgba (alpha-0 excluded) -> count
+    local hist = {}                  -- key (r<<16|g<<8|b) -> total pixel count across frames
+    local frames_seen = {}           -- key -> number of distinct frames containing this colour
     local alpha_present = false
-    for _, layer in ipairs(sprite.layers) do
-        if layer.isVisible and not layer.isReference then
-            for _, cel in ipairs(layer.cels) do
-                local img = cel.image
-                if img then
-                    for it in img:pixels() do
-                        local px = it()
-                        local a = pc.rgbaA(px)
-                        if a == 0 then
-                            alpha_present = true
-                        else
-                            local r = pc.rgbaR(px)
-                            local g = pc.rgbaG(px)
-                            local b = pc.rgbaB(px)
-                            local key = r * 65536 + g * 256 + b
-                            hist[key] = (hist[key] or 0) + 1
-                            if a < 255 then alpha_present = true end
-                        end
-                    end
+    local total_frames = #sprite.frames
+    for f = 1, total_frames do
+        local img = Image(sprite.spec)
+        img:drawSprite(sprite, f)
+        local seen_this_frame = {}
+        for it in img:pixels() do
+            local px = it()
+            local a = pc.rgbaA(px)
+            if a == 0 then
+                alpha_present = true
+            else
+                local r = pc.rgbaR(px)
+                local g = pc.rgbaG(px)
+                local b = pc.rgbaB(px)
+                local key = r * 65536 + g * 256 + b
+                hist[key] = (hist[key] or 0) + 1
+                if not seen_this_frame[key] then
+                    seen_this_frame[key] = true
+                    frames_seen[key] = (frames_seen[key] or 0) + 1
                 end
+                if a < 255 then alpha_present = true end
             end
         end
     end
-    return hist, alpha_present
+    return hist, alpha_present, frames_seen, total_frames
 end
 
 -- ============================================================
@@ -549,9 +557,9 @@ end
 -- Accent detection (rare-or-vivid colours preserved as standalone palette entries)
 -- ============================================================
 
--- Compute combined salience (chroma MAD + visibility) for chromatic entries.
+-- Compute combined salience (chroma MAD + visibility + frame coverage) for chromatic entries.
 -- Returns: scores[i] in [0,1] per chromatic index, or nil if input too small/degenerate.
-local function compute_accent_scores(chromatic, total_pixels)
+local function compute_accent_scores(chromatic, total_pixels, total_frames)
     local n = #chromatic
     if n < 4 then return nil end
 
@@ -575,22 +583,36 @@ local function compute_accent_scores(chromatic, total_pixels)
     local log_denom = math.log(max_w + 1)
     if log_denom < 1e-6 then log_denom = 1e-6 end
 
-    -- Upper frequency guard: ignore very common colours (≥ 15% of opaque pixels);
+    local tf = math.max(1, total_frames or 1)
+    -- Upper frequency guard: ignore very common colours (≥ 12% of opaque pixels);
     -- those belong in ramps, not as standalone accents.
-    local common_cutoff = math.max(1, total_pixels * 0.15)
+    local common_cutoff = math.max(1, total_pixels * 0.12)
     -- Pixel floor: skip 1-pixel noise on larger sprites; preserve singletons on tiny sprites.
     local pixel_floor = (total_pixels < 512) and 1 or math.max(2, math.ceil(total_pixels / 2000))
 
+    -- Accents are chroma-led. Visibility and frame coverage act as GATES, not
+    -- rewards: rewarding either pulls common ramp colours into the accent slots
+    -- (the eye-red case where w=24 vivid loses to a w=210 mid-chroma skin tone).
     local scores = {}
     for i = 1, n do
         local e = chromatic[i]
-        if e.w < pixel_floor or e.w >= common_cutoff then
+        local frames = e.frames or 1
+        -- Gates
+        local single_frame_noise = (tf > 1) and (frames == 1) and (e.w <= 2)
+        local too_rare = e.w < pixel_floor
+        local too_common = e.w >= common_cutoff
+        if too_rare or too_common or single_frame_noise then
             scores[i] = 0
         else
             local z = (e.C - median_c) / sigma_hat
             local S_c = math.max(0, math.min(1, z / 3.0))
-            local importance = math.log(e.w + 1) / log_denom
-            scores[i] = 0.65 * S_c + 0.35 * importance
+            -- Light frame-stability tiebreaker: a vivid colour that recurs is more
+            -- likely an intentional accent than a one-frame artefact, but the
+            -- weight is small so it cannot promote a mid-chroma colour above a
+            -- high-chroma one. Capped so single-cel-but-many-pixel accents
+            -- (cel covers one frame, eg. eye glint) aren't unfairly penalised.
+            local frame_factor = 0.85 + 0.15 * math.min(1.0, frames / math.max(2, tf * 0.5))
+            scores[i] = S_c * frame_factor
         end
     end
     return scores
@@ -917,8 +939,8 @@ local function run(cfg)
     if cfg.mode == "Stylise" then cfg.strength = 1.0 end
     cfg.strength = clamp(cfg.strength, 0, 1)
 
-    -- 1. Histogram
-    local hist, alpha_present = collect_histogram(sprite)
+    -- 1. Histogram (composited per-frame)
+    local hist, alpha_present, frames_seen, total_frames = collect_histogram(sprite)
     local unique_count = 0
     for _ in pairs(hist) do unique_count = unique_count + 1 end
     if unique_count == 0 then
@@ -937,6 +959,7 @@ local function run(cfg)
         entries[#entries + 1] = {
             key = key, r = r, g = g, b = b, w = w,
             L = L, A = A, B = B, C = C, h = h,
+            frames = frames_seen[key] or 1,
         }
     end
 
@@ -957,11 +980,17 @@ local function run(cfg)
 
     local accents, accent_key_set = {}, {}
     if cfg.accent_detection and cfg.max_accent_slots and cfg.max_accent_slots > 0 then
-        local scores = compute_accent_scores(chromatic, total_opaque)
+        local scores = compute_accent_scores(chromatic, total_opaque, total_frames)
         if scores then
             local hard_cap = math.max(0, math.floor((#chromatic - 1) / 3))
             local cap = math.min(cfg.max_accent_slots, hard_cap)
-            accents, accent_key_set = select_accents(chromatic, scores, cfg.accent_score_threshold, cap)
+            -- Reserve at least half the slots for per-cluster promotion downstream,
+            -- which is the only signal that can rescue intra-cluster vivid outliers
+            -- (e.g. an eye red trapped inside a brown cluster's k-means partition).
+            -- Initial pass only takes genuine sprite-wide outliers; promotion picks
+            -- up local outliers afterwards.
+            local initial_cap = math.max(1, math.floor(cap / 2))
+            accents, accent_key_set = select_accents(chromatic, scores, cfg.accent_score_threshold, initial_cap)
         end
     end
 
@@ -1004,7 +1033,18 @@ local function run(cfg)
         target_ramps = math.floor(cfg.ramps)
     else
         if #chrom_for_cluster >= 2 then
-            target_ramps = elbow_k(chrom_for_cluster, math.min(cfg.elbow_kmax, #chrom_for_cluster))
+            -- Auto: pick elbow, but in Total-colours mode also enforce a floor based on
+            -- target_colours so a big budget doesn't get bottlenecked into 2 fat ramps.
+            -- Empirical: ~sqrt(target) gives a healthy ramp-vs-stop ratio. Clamp to a
+            -- generous cap so we still consolidate when the sprite has few hues.
+            local elbow_cap = math.min(cfg.elbow_kmax, #chrom_for_cluster)
+            local k_floor = 2
+            if cfg.size_mode == "Total colours" and cfg.target_colours then
+                local budget_floor = math.floor(math.sqrt(math.max(4, cfg.target_colours - #accents)) + 0.5)
+                k_floor = math.max(k_floor, math.min(budget_floor, elbow_cap))
+            end
+            local k_elbow = elbow_k(chrom_for_cluster, elbow_cap)
+            target_ramps = math.max(k_elbow, k_floor)
         else
             target_ramps = #chrom_for_cluster
         end
@@ -1124,6 +1164,16 @@ local function run(cfg)
     -- 10. Flatten palette (also emits accents between shared_light and grey)
     local palette_entries, ordered_ramps, stop_to_pal, accent_key_to_pi =
         flatten_palette(ramps, alpha_present, shared_dark, shared_light, accents, cfg.accent_tolerance)
+
+    local params_dbg = app.params or {}
+    if params_dbg.debug == "1" or params_dbg.debug == "true" then
+        print(string.format("[debug] entries=%d chromatic=%d accents=%d ramps=%d palette=%d frames=%d",
+            #entries, #chromatic, #accents, #ramps, #palette_entries, total_frames or 1))
+        for i, a in ipairs(accents) do
+            print(string.format("[debug] accent %d #%02X%02X%02X C=%.3f w=%d frames=%d/%d",
+                i, a.r, a.g, a.b, a.C, a.w, a.frames or 1, total_frames or 1))
+        end
+    end
 
     -- 11. Re-map original assignments to (possibly reordered) ordered_ramps
     local ramp_to_ordered = {}
