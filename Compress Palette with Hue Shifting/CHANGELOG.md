@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7 — Pixel-art contrast preservation
+
+- **`Preserve contrast` toggle (default ON).** Adjacent regions with different identities (e.g. warm skin vs neutral shirt) were collapsing into visually similar near-white blobs because each chromatic ramp's top stop was being shared into one weighted-average light entry with OKLab ΔE ≈ 0.025 from the grey ramp's top. The toggle disables `shared_highlight` for the run so each chromatic ramp keeps its own distinct top, lowers `L_hi_abs` from 0.92 to 0.86 so warm tops stay coloured rather than bleached, and asymmetrically raises the highlight-side chroma-bell floor from 0.25 to 0.45 so ramp tops carry their hue identity. The shadow side is unchanged so darks don't pick up a coloured rim.
+- **Accent tolerance tightened from 0.07 to 0.04.** With the lower highlight L cap, ramp midpoints sit closer to several source accents (e.g. eye reds at L≈0.46). The wider tolerance was deduping legitimate accents into ramp stops; the new tolerance keeps the source colour as a standalone palette entry so the eye/rim accent renders verbatim.
+- **CLI:** new `preserve_contrast`, `contrast_l_hi_abs`, `contrast_highlight_bell_floor` params. Dialog gains a single `Preserve contrast` checkbox.
+- **Internal:** the highlight bell floor is now asymmetric (`shadow_bell_floor` const; `highlight_bell_floor` driven by config), so future tuning of one extreme doesn't disturb the other.
+
 ## v0.6 — Multi-frame correctness and chroma-led accents
 
 - **Frame-composited histogram.** `collect_histogram` now walks every frame via `Image:drawSprite` instead of reading raw cel pixels. This matches what an exporter sees: hidden layers, overpainted regions, and stray cels under upper layers no longer pollute the histogram, and a colour visible on multiple frames is counted on each frame so frame-stable accents (eye glints, rim lights) carry their true visual weight. Every entry now carries a `frames` field with the number of distinct frames it appears on.

@@ -1,4 +1,4 @@
--- Compress Palette with Hue Shifting V0.6
+-- Compress Palette with Hue Shifting V0.7
 -- Install:
 -- 1. Save this file as "Compress Palette with Hue Shifting.lua".
 -- 2. Copy or symlink it (and its folder) into %APPDATA%\Aseprite\scripts.
@@ -34,8 +34,12 @@ local DEFAULT_CONFIG <const> = {
     accent_detection = true,
     max_accent_slots = 8,
     accent_score_threshold = 0.80,
-    accent_tolerance = 0.07,        -- OKLab ΔE below which accent is considered already represented
+    accent_tolerance = 0.04,        -- OKLab ΔE below which accent is considered already represented
     accent_cluster_floor = 0.06,    -- absolute OKLCh chroma below which per-cluster outliers are ignored
+    -- Pixel-art contrast preservation
+    preserve_contrast = true,        -- when true: per-ramp distinct tops + lower bleach + warmer extremes
+    contrast_l_hi_abs = 0.86,        -- absolute highlight L cap when preserve_contrast = true (vs 0.92 default)
+    contrast_highlight_bell_floor = 0.45, -- chroma-bell floor at the highlight extreme (vs 0.25 default)
 }
 
 local pc <const> = app.pixelColor
@@ -403,7 +407,7 @@ local function build_chromatic_ramp(entries, cluster_indices, cfg, stops_overrid
         L_hi_src = math.min(1, L_hi_src + 0.08)
     end
     local L_lo_abs <const> = 0.15
-    local L_hi_abs <const> = 0.92
+    local L_hi_abs = (cfg.preserve_contrast and cfg.contrast_l_hi_abs) or 0.92
     local s = cfg.strength
     local L_lo = lerp(L_lo_src, L_lo_abs, s)
     local L_hi = lerp(L_hi_src, L_hi_abs, s)
@@ -438,14 +442,21 @@ local function build_chromatic_ramp(entries, cluster_indices, cfg, stops_overrid
     end
     n = clamp(n, 2, 16)
 
+    local shadow_bell_floor <const> = 0.25
+    local highlight_bell_floor = (cfg.preserve_contrast and cfg.contrast_highlight_bell_floor) or 0.25
+
     local stops = {}
     for k = 1, n do
         local t = (k - 1) / (n - 1)
         local ts = smoothstep(t)
         local L = lerp(L_lo, L_hi, ts)
-        -- Chroma bell
+        -- Chroma bell, asymmetric: highlight side may use a higher floor under
+        -- preserve_contrast so warm-tone tops don't bleach into a near-grey that
+        -- collides with the grey ramp. The shadow side keeps a lower floor so
+        -- darks remain perceptually stable rather than picking up a coloured rim.
         local bell = 1 - 4 * (t - 0.5) * (t - 0.5)
-        bell = math.max(0.25, bell)
+        local floor = (t >= 0.5) and highlight_bell_floor or shadow_bell_floor
+        bell = math.max(floor, bell)
         local C = C_base * bell
         -- Hue temperature pull
         local h
@@ -925,6 +936,9 @@ local function parse_cli_params(cfg)
     cfg.accent_score_threshold = num("accent_score_threshold") or cfg.accent_score_threshold
     cfg.accent_tolerance = num("accent_tolerance") or cfg.accent_tolerance
     cfg.accent_cluster_floor = num("accent_cluster_floor") or cfg.accent_cluster_floor
+    local pc_flag = bool("preserve_contrast"); if pc_flag ~= nil then cfg.preserve_contrast = pc_flag end
+    cfg.contrast_l_hi_abs = num("contrast_l_hi_abs") or cfg.contrast_l_hi_abs
+    cfg.contrast_highlight_bell_floor = num("contrast_highlight_bell_floor") or cfg.contrast_highlight_bell_floor
     return cfg
 end
 
@@ -938,6 +952,12 @@ local function run(cfg)
 
     if cfg.mode == "Stylise" then cfg.strength = 1.0 end
     cfg.strength = clamp(cfg.strength, 0, 1)
+
+    -- preserve_contrast forces per-ramp distinct tops so warm-tone highlights don't
+    -- collapse into the grey ramp's near-white. Shadow sharing stays on for unity.
+    if cfg.preserve_contrast then
+        cfg.shared_highlight = false
+    end
 
     -- 1. Histogram (composited per-frame)
     local hist, alpha_present, frames_seen, total_frames = collect_histogram(sprite)
@@ -1331,6 +1351,8 @@ local function show_dialog()
     dlg:number { id = "max_accent_slots", label = "Accent slots",
         text = tostring(cfg.max_accent_slots), decimals = 0,
         visible = cfg.accent_detection }
+    dlg:check { id = "preserve_contrast", label = "Preserve contrast",
+        selected = cfg.preserve_contrast }
     dlg:separator()
     dlg:combobox { id = "output", label = "Output", option = cfg.output,
         options = { "New layer", "In place" } }
@@ -1350,6 +1372,7 @@ local function show_dialog()
     cfg.strength = (data.strength or 50) / 100.0
     cfg.accent_detection = data.accent_detection
     cfg.max_accent_slots = data.max_accent_slots or cfg.max_accent_slots
+    cfg.preserve_contrast = data.preserve_contrast
     cfg.output = data.output
     run(cfg)
 end
